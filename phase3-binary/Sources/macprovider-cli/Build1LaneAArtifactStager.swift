@@ -169,7 +169,11 @@ struct Build1LaneAArtifactStager {
             try progress(.staging, 0, expected)
             do {
                 try resolver.validateNoSymlinkCachePath(of: staged, requireComplete: false)
-                try await resolver.downloader.downloadSnapshot(
+                // SPEC-044 headroom is enforced by requireDiskSpace above;
+                // the downloader's autotune reserve does not apply here.
+                var downloader = resolver.downloader
+                downloader.freeSpaceReserveBytes = nil
+                try await downloader.downloadSnapshot(
                     modelID: authority.modelID,
                     revision: authority.revision,
                     to: staged,
@@ -306,6 +310,9 @@ struct Build1LaneAArtifactStager {
         }
         if let staging = error as? Build1LaneAArtifactStagingError {
             return staging
+        }
+        if case let AutotuneRecommendError.insufficientDiskSpace(_, required, available)? = error as? AutotuneRecommendError {
+            return .insufficientDiskSpace(requiredBytes: required, availableBytes: available)
         }
         return .transferFailed(String(describing: error))
     }

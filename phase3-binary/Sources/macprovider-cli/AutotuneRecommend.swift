@@ -10,6 +10,7 @@ enum AutotuneRecommendError: Error, Equatable, CustomStringConvertible {
     case invalidArtifact(String)
     case candidateProbeFailed(modelKey: String, reason: String)
     case noHMACSecret
+    case insufficientDiskSpace(modelID: String, requiredBytes: Int64, availableBytes: Int64)
 
     var description: String {
         switch self {
@@ -23,6 +24,19 @@ enum AutotuneRecommendError: Error, Equatable, CustomStringConvertible {
             return "candidate probe failed for \(modelKey): \(reason)"
         case .noHMACSecret:
             return "HMAC secret unavailable"
+        case .insufficientDiskSpace(let modelID, let requiredBytes, let availableBytes):
+            let gb = { (bytes: Int64) in String(format: "%.1f GB", Double(bytes) / 1_000_000_000) }
+            return "not enough free disk space to download \(modelID): need \(gb(requiredBytes)), \(gb(availableBytes)) available"
+        }
+    }
+
+    /// Errors that disqualify one catalog candidate without ending the sweep:
+    /// an unusable artifact, or a model too large for the remaining disk.
+    var perCandidateSkipReason: String? {
+        switch self {
+        case .invalidArtifact(let message): return message
+        case .insufficientDiskSpace: return description
+        default: return nil
         }
     }
 }
@@ -3418,6 +3432,22 @@ struct HuggingFaceSnapshotDownloader {
 
     struct Sibling: Decodable {
         var rfilename: String
+        /// Present because apiURL requests `blobs=true`.
+        var size: Int64?
+    }
+
+    /// Free space that must remain after a snapshot download, so an
+    /// autotune sweep cannot fill the disk of the Mac it runs on.
+    static let downloadFreeSpaceReserveBytes: Int64 = 5 * 1024 * 1024 * 1024
+
+    /// nil disables the check, for callers that enforce their own disk
+    /// budget (SPEC-044 `models prepare`).
+    var freeSpaceReserveBytes: Int64? = HuggingFaceSnapshotDownloader.downloadFreeSpaceReserveBytes
+
+    var availableDiskBytes: @Sendable (URL) throws -> Int64 = { url in
+        try Build1LaneAArtifactStager.systemDiskProbe(
+            Build1LaneAArtifactStager.nearestExistingAncestor(of: url)
+        ).availableBytes
     }
 
     private struct FetchResponseBox: @unchecked Sendable {
@@ -3593,6 +3623,7 @@ struct HuggingFaceSnapshotDownloader {
         guard !siblings.isEmpty else {
             throw AutotuneRecommendError.invalidArtifact("empty HuggingFace snapshot \(modelID)@\(revision)")
         }
+        try requireDiskSpace(for: siblings, modelID: modelID, destination: snapshot)
         let staging = snapshot.deletingLastPathComponent()
             .appendingPathComponent(".download-\(revision)-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
@@ -3611,6 +3642,9 @@ struct HuggingFaceSnapshotDownloader {
                     let (temporary, response) = try await download(downloadRequest, deadline)
                     return DownloadResponseBox(url: temporary, response: response)
                 }
+                // Covers every exit (deadline, bad status, failed move); a
+                // no-op once the file has been moved into staging.
+                defer { try? FileManager.default.removeItem(at: result.url) }
                 try Self.assertDeadlineActive(deadline)
                 guard (result.response as? HTTPURLResponse).map({ (200..<300).contains($0.statusCode) }) ?? true else {
                     throw AutotuneRecommendError.invalidArtifact("download failed \(sibling.rfilename)")
@@ -3625,6 +3659,30 @@ struct HuggingFaceSnapshotDownloader {
         } catch {
             try? FileManager.default.removeItem(at: staging)
             throw error
+        }
+    }
+
+    /// Refuses a download that would leave less than
+    /// `downloadFreeSpaceReserveBytes` free. Sizes come from the HF
+    /// `blobs=true` listing; a listing without sizes keeps the previous
+    /// behaviour rather than guessing.
+    func requireDiskSpace(for siblings: [Sibling], modelID: String, destination: URL) throws {
+        var total: Int64 = 0
+        for sibling in siblings {
+            guard let size = sibling.size, size > 0 else { continue }
+            let sum = total.addingReportingOverflow(size)
+            total = sum.overflow ? .max : sum.partialValue
+        }
+        guard let reserve = freeSpaceReserveBytes, total > 0 else { return }
+        let needed = total.addingReportingOverflow(reserve)
+        let requiredBytes = needed.overflow ? Int64.max : needed.partialValue
+        let availableBytes = try availableDiskBytes(destination)
+        guard availableBytes >= requiredBytes else {
+            throw AutotuneRecommendError.insufficientDiskSpace(
+                modelID: modelID,
+                requiredBytes: requiredBytes,
+                availableBytes: availableBytes
+            )
         }
     }
 
@@ -3851,6 +3909,11 @@ struct CachedModelArtifactResolver {
                     try await downloader.downloadSnapshot(modelID: row.modelID, revision: revision, to: snapshot, deadline: deadline)
                 } catch AutotuneContextCalibrationError.deadlineExceeded {
                     throw AutotuneContextCalibrationError.deadlineExceeded
+                } catch let error as AutotuneRecommendError {
+                    if case .insufficientDiskSpace = error { throw error }
+                    throw AutotuneRecommendError.invalidArtifact(
+                        message + "; automatic repair failed: " + String(describing: error)
+                    )
                 } catch {
                     throw AutotuneRecommendError.invalidArtifact(
                         message + "; automatic repair failed: " + String(describing: error)
@@ -3903,6 +3966,11 @@ struct CachedModelArtifactResolver {
 
         do {
             try await downloader.downloadSnapshot(modelID: row.modelID, revision: revision, to: prefetched)
+        } catch let error as AutotuneRecommendError {
+            if case .insufficientDiskSpace = error { throw error }
+            throw AutotuneRecommendError.invalidArtifact(
+                "isolated artifact prefetch failed: " + String(describing: error)
+            )
         } catch {
             throw AutotuneRecommendError.invalidArtifact(
                 "isolated artifact prefetch failed: " + String(describing: error)
@@ -4271,8 +4339,8 @@ struct AutotuneRecommendationBenchmarker {
                     sha256: artifact.sha256
                 ))
             } catch let error as AutotuneRecommendError {
-                guard case .invalidArtifact(let message) = error else { throw error }
-                diagnostics.append(PrefetchDiagnostic(modelID: row.modelID, reason: message))
+                guard let reason = error.perCandidateSkipReason else { throw error }
+                diagnostics.append(PrefetchDiagnostic(modelID: row.modelID, reason: reason))
             }
         }
         return ArtifactPrefetchOutcomes(
@@ -4471,9 +4539,9 @@ struct AutotuneRecommendationBenchmarker {
                 if prefetchedArtifacts != nil {
                     throw error
                 }
-                if case .invalidArtifact(let message) = error {
-                    diagnostics[modelKey] = message
-                    progress("paid-yield: \(step) skipped \(row.modelID): \(message)")
+                if let reason = error.perCandidateSkipReason {
+                    diagnostics[modelKey] = reason
+                    progress("paid-yield: \(step) skipped \(row.modelID): \(reason)")
                     continue
                 }
                 throw error
